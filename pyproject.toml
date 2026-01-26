@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "nyc-311-bayesian-noise-models"
+version = "0.1.0"
+description = ""
+authors = ["Moses McCall <mosesmc52@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+pandas = "^3.0.0"
+python-dotenv = "^1.2.1"
+pytensor = "2.31.7"
+ipywidgets = "^8.1.8"
+jupyterlab = "^4.5.3"
+pymc = "5.25.1"
+seaborn = "^0.13.2"
+geopandas = "^1.1.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.setuptools.packages.find]
+where = ["."]
