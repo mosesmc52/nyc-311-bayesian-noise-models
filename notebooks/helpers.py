@@ -387,6 +387,73 @@ def make_daily_table_for_model_with_puma(df, *, complaint_value=None, complaint_
     coords = {"puma": puma_labels, "dow": dow_labels}
     return daily_df, coords
 
+
+# def make_daily_table_for_model_with_nta(
+#     df,
+#     *,
+#     complaint_value=None,
+#     complaint_col="descriptor_group",
+# ):
+#     """
+#     Returns:
+#       daily_df with columns:
+#         puma, nta_name, dow, date, daily_count,
+#         puma_idx, nta_idx, dow_idx
+
+#       coords dict for PyMC
+#     """
+
+#     x = df.copy()
+#     x["created_bucket"] = pd.to_datetime(x["created_bucket"], errors="coerce")
+#     x = x[x["created_bucket"].notna()].copy()
+
+#     # Summer only
+#     x = x[x["created_bucket"].dt.month.isin([6, 7, 8])].copy()
+
+#     if complaint_value is not None:
+#         x = x[x[complaint_col].astype(str) == str(complaint_value)].copy()
+
+#     # Normalize keys
+#     x["date"] = x["created_bucket"].dt.normalize()
+#     x["dow"] = x["date"].dt.day_name()
+#     x["puma"] = x["puma"].astype(str).str.strip()
+#     x["nta_name"] = x["nta_name"].astype(str).str.strip()
+
+#     # Aggregate to daily counts
+#     daily_df = (
+#         x.groupby(["puma", "nta_name", "dow", "date"], as_index=False)["complaint_count"]
+#          .sum()
+#          .rename(columns={"complaint_count": "daily_count"})
+#     )
+
+#     # --- Build indices ---
+
+#     # PUMA
+#     puma_labels, puma_idx = np.unique(daily_df["puma"], return_inverse=True)
+
+#     # NTA
+#     nta_labels, nta_idx = np.unique(daily_df["nta_name"], return_inverse=True)
+
+#     # Day-of-week (fixed order)
+#     dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+#     daily_df["dow"] = pd.Categorical(daily_df["dow"], categories=dow_order, ordered=True)
+#     daily_df = daily_df.dropna(subset=["dow"]).copy()
+#     dow_idx = daily_df["dow"].cat.codes.to_numpy()
+
+#     # Attach indices
+#     daily_df["puma_idx"] = puma_idx[daily_df.index]
+#     daily_df["nta_idx"] = nta_idx[daily_df.index]
+#     daily_df["dow_idx"] = dow_idx
+
+#     # Coords for PyMC
+#     coords = {
+#         "puma": puma_labels,
+#         "nta": nta_labels,
+#         "dow": np.array(dow_order),
+#     }
+
+#     return daily_df, coords
+
 def make_daily_table_for_model_with_nta(
     df,
     *,
@@ -396,10 +463,10 @@ def make_daily_table_for_model_with_nta(
     """
     Returns:
       daily_df with columns:
-        puma, nta_name, dow, date, daily_count,
-        puma_idx, nta_idx, dow_idx
+        puma, nta_name, dow, date, year, daily_count,
+        puma_idx, nta_idx, dow_idx, year_idx
 
-      coords dict for PyMC
+      coords dict for PyMC (includes year)
     """
 
     x = df.copy()
@@ -412,20 +479,30 @@ def make_daily_table_for_model_with_nta(
     if complaint_value is not None:
         x = x[x[complaint_col].astype(str) == str(complaint_value)].copy()
 
-    # Normalize keys
+    # -----------------------------
+    # Normalize / derive keys
+    # -----------------------------
     x["date"] = x["created_bucket"].dt.normalize()
+    x["year"] = x["date"].dt.year.astype(int)
     x["dow"] = x["date"].dt.day_name()
     x["puma"] = x["puma"].astype(str).str.strip()
     x["nta_name"] = x["nta_name"].astype(str).str.strip()
 
+    # -----------------------------
     # Aggregate to daily counts
+    # -----------------------------
     daily_df = (
-        x.groupby(["puma", "nta_name", "dow", "date"], as_index=False)["complaint_count"]
-         .sum()
-         .rename(columns={"complaint_count": "daily_count"})
+        x.groupby(
+            ["puma", "nta_name", "dow", "date", "year"],
+            as_index=False
+        )["complaint_count"]
+        .sum()
+        .rename(columns={"complaint_count": "daily_count"})
     )
 
-    # --- Build indices ---
+    # -----------------------------
+    # Build indices
+    # -----------------------------
 
     # PUMA
     puma_labels, puma_idx = np.unique(daily_df["puma"], return_inverse=True)
@@ -435,20 +512,36 @@ def make_daily_table_for_model_with_nta(
 
     # Day-of-week (fixed order)
     dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    daily_df["dow"] = pd.Categorical(daily_df["dow"], categories=dow_order, ordered=True)
+    daily_df["dow"] = pd.Categorical(
+        daily_df["dow"],
+        categories=dow_order,
+        ordered=True,
+    )
     daily_df = daily_df.dropna(subset=["dow"]).copy()
     dow_idx = daily_df["dow"].cat.codes.to_numpy()
 
+    # Year (sorted, stable)
+    year_labels = np.sort(daily_df["year"].unique()).astype(int)
+    year_to_idx = {y: i for i, y in enumerate(year_labels)}
+    year_idx = daily_df["year"].map(year_to_idx).to_numpy()
+
+    # -----------------------------
     # Attach indices
+    # -----------------------------
     daily_df["puma_idx"] = puma_idx[daily_df.index]
     daily_df["nta_idx"] = nta_idx[daily_df.index]
     daily_df["dow_idx"] = dow_idx
+    daily_df["year_idx"] = year_idx
 
+    # -----------------------------
     # Coords for PyMC
+    # -----------------------------
     coords = {
         "puma": puma_labels,
         "nta": nta_labels,
         "dow": np.array(dow_order),
+        "year": year_labels,
+        "obs": np.arange(len(daily_df)),  # useful for mu_obs dims
     }
 
     return daily_df, coords
@@ -793,3 +886,26 @@ def make_daily_observed_2025(
     daily_obs["date"] = pd.to_datetime(daily_obs["date"]).astype("datetime64[ns]")
 
     return daily_obs
+
+def plot_coverage_curve(
+    y_obs: np.ndarray,
+    y_pp: np.ndarray,
+    *,
+    label: str,
+    color: str = "C0",
+):
+    """
+    y_obs : shape (n_obs,)
+    y_pp  : shape (n_obs, n_draws)
+    """
+
+    levels = np.linspace(0.1, 0.9, 9)
+    empirical = []
+
+    for lvl in levels:
+        lo = np.quantile(y_pp, (1 - lvl) / 2, axis=1)
+        hi = np.quantile(y_pp, 1 - (1 - lvl) / 2, axis=1)
+        covered = (y_obs >= lo) & (y_obs <= hi)
+        empirical.append(covered.mean())
+
+    plt.plot(levels, empirical, marker="o", label=label, color=color)
