@@ -61,6 +61,14 @@ def prep_the_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- clean / normalize keys ---
     df["puma"] = df["puma"].astype("string").str.strip()
+    df["nta_name"] = df["nta_name"].astype("string").str.strip()
+
+    # --- combine geography label (NTA + PUMA) ---
+    df["nta_puma"] = (
+        df["nta_name"].fillna("Unknown")
+        + " — "
+        + df["puma"].fillna("Unknown")
+    )
 
     # --- derive calendar fields ---
     df["dow"] = df["created_bucket"].dt.day_name()
@@ -80,18 +88,20 @@ def prep_the_data(df: pd.DataFrame) -> pd.DataFrame:
     df["is_weekend"] = df["dow"].isin(["Saturday", "Sunday"]).astype("int8")
 
     # --- month_year label ---
-    df["month_year"] = df["month"].astype("string") + "__" + df["created_bucket"].dt.year.astype("Int64").astype("string")
-
-
+    df["month_year"] = (
+        df["month"].astype("string")
+        + "__"
+        + df["created_bucket"].dt.year.astype("Int64").astype("string")
+    )
 
     df["descriptor_group"] = df["descriptor"].map(descriptor_group).astype("string")
 
-    # --- build dow_complaint from aggregated descriptor_group (NOT raw descriptor) ---
+    # --- build dow_complaint from aggregated descriptor_group ---
     df["dow_complaint"] = (
         df["descriptor_group"]
         .astype("string")
         .str.upper()
-        .str.replace(r"[,_/]", " ", regex=True)  # keep it safe for tokenizing
+        .str.replace(r"[,_/]", " ", regex=True)
         .str.replace(r"\s+", " ", regex=True)
         .str.strip()
         .str.replace(" ", "_")
@@ -100,6 +110,7 @@ def prep_the_data(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return df
+
 
 
 
@@ -612,9 +623,30 @@ def plot_topn_shrinkage_vs_raw(
     post_mean_col: str = "lam_mean",
     post_low_col: str = "lam_low_90",
     post_high_col: str = "lam_high_90",
+    label_col: str = "nta_puma",   # <-- NEW
 ):
-    cols = ["puma", "dow", raw_col, post_mean_col, post_low_col, post_high_col]
+    # --- ensure we have a clean label column ---
+    if label_col not in cmp.columns:
+        # common case: pandas suffixes after merges
+        if f"{label_col}_x" in cmp.columns or f"{label_col}_y" in cmp.columns:
+            cmp = cmp.copy()
+            cmp[label_col] = cmp.get(f"{label_col}_x")
+            if f"{label_col}_y" in cmp.columns:
+                cmp[label_col] = cmp[label_col].fillna(cmp[f"{label_col}_y"])
+        else:
+            raise KeyError(
+                f"'{label_col}' not found in cmp. "
+                f"Available label-like cols: {[c for c in cmp.columns if 'nta' in c or 'puma' in c]}"
+            )
+
+    cols = [label_col, "puma", "dow", raw_col, post_mean_col, post_low_col, post_high_col]
+
+    # get top-N; make_topn_table will still create top["label"] using puma+dow,
+    # so we'll overwrite it with an nta_puma-based label after.
     top = make_topn_table(cmp, sort_by=sort_by, ascending=False, n=n, cols=cols)
+
+    # --- overwrite plotting label to use nta_puma for readability ---
+    top["label"] = top[label_col].astype(str) + " | " + top["dow"].astype(str)
 
     y = np.arange(len(top))
 
@@ -655,6 +687,7 @@ def plot_topn_shrinkage_vs_raw(
     return top
 
 
+
 def plot_topn_absdiff(
     cmp: pd.DataFrame,
     *,
@@ -662,10 +695,28 @@ def plot_topn_absdiff(
     raw_col: str = "city_weekday_mean",
     post_mean_col: str = "lam_mean",
     absdiff_col: str = "abs_diff",
-    width_col: str = "lam_width_90"
+    width_col: str = "lam_width_90",
+    label_col: str = "nta_puma",   # <-- NEW
 ):
-    cols = ["puma", "dow", raw_col, post_mean_col, absdiff_col, width_col]
+    # --- ensure we have a clean label column ---
+    if label_col not in cmp.columns:
+        # common case: pandas suffixes after merges
+        if f"{label_col}_x" in cmp.columns or f"{label_col}_y" in cmp.columns:
+            cmp = cmp.copy()
+            cmp[label_col] = cmp.get(f"{label_col}_x")
+            if f"{label_col}_y" in cmp.columns:
+                cmp[label_col] = cmp[label_col].fillna(cmp[f"{label_col}_y"])
+        else:
+            raise KeyError(
+                f"'{label_col}' not found in cmp. "
+                f"Available label-like cols: {[c for c in cmp.columns if 'nta' in c or 'puma' in c]}"
+            )
+
+    cols = [label_col, "puma", "dow", raw_col, post_mean_col, absdiff_col, width_col]
     top = make_topn_table(cmp, sort_by=absdiff_col, ascending=False, n=n, cols=cols)
+
+    # Override y-axis label to use nta_puma for readability
+    top["label"] = top[label_col].astype(str) + " | " + top["dow"].astype(str)
 
     # Signed delta is more informative than abs_diff for a plot
     delta = top[post_mean_col] - top[raw_col]
@@ -695,6 +746,7 @@ def plot_topn_absdiff(
     plt.show()
 
     return top
+
 
 
 def export_idata(idata, out_path: str):
