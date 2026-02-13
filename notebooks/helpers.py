@@ -1,3 +1,5 @@
+import random
+from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -894,3 +896,654 @@ def plot_coverage_curve(
         empirical.append(covered.mean())
 
     plt.plot(levels, empirical, marker="o", label=label, color=color)
+
+
+def score_against_real_2025_days(
+    *,
+    daily_2025: pd.DataFrame,
+    idata,
+    coords: dict,
+    year_fallback: str = "nearest",   # "nearest" | "zero" | "error"
+    hdi_prob: float = 0.90,
+    random_seed: int = 42,
+):
+    df = daily_2025.copy()
+
+    # -----------------------------
+    # 1) Hygiene
+    # -----------------------------
+    df["puma"] = df["puma"].astype(str).str.strip()
+    df["dow"]  = df["dow"].astype(str).str.strip()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df = df[df["date"].notna()].copy()
+    df["year"] = df["date"].dt.year.astype(int)
+
+    # -----------------------------
+    # 2) Index maps
+    # -----------------------------
+    puma_to_idx = {str(p): i for i, p in enumerate(coords["puma"])}
+    dow_to_idx  = {str(d): i for i, d in enumerate(coords["dow"])}
+
+    df["puma_idx"] = df["puma"].map(puma_to_idx)
+    df["dow_idx"]  = df["dow"].map(dow_to_idx)
+
+    df = df.dropna(subset=["puma_idx", "dow_idx"]).copy()
+    df["puma_idx"] = df["puma_idx"].astype(int)
+    df["dow_idx"]  = df["dow_idx"].astype(int)
+
+    # Year mapping if the model has year coords
+    has_year = "year" in coords and coords["year"] is not None and len(coords["year"]) > 0
+    if has_year:
+        year_labels = [int(y) for y in coords["year"]]
+        year_to_idx = {int(y): i for i, y in enumerate(year_labels)}
+
+        def map_year(y):
+            if y in year_to_idx:
+                return year_to_idx[y]
+            if year_fallback == "nearest":
+                nearest = min(year_labels, key=lambda t: abs(t - y))
+                return year_to_idx[nearest]
+            if year_fallback == "zero":
+                return None
+            if year_fallback == "error":
+                return None
+            raise ValueError("year_fallback must be nearest|zero|error")
+
+        df["year_idx"] = df["year"].map(map_year)
+    else:
+        df["year_idx"] = None
+
+    # Date mapping if the model has date coords (day_shock)
+    has_date = "date" in coords and coords["date"] is not None and len(coords["date"]) > 0
+    if has_date:
+        # Normalize coord dates to Timestamp for mapping
+        coord_dates = pd.to_datetime(coords["date"]).normalize()
+        date_to_idx = {pd.Timestamp(d): i for i, d in enumerate(coord_dates)}
+        df["date_idx"] = df["date"].map(date_to_idx)
+    else:
+        df["date_idx"] = None
+
+    # -----------------------------
+    # 3) Pull posterior draws
+    # -----------------------------
+    post = idata.posterior
+
+    # Baseline log_lambda(puma,dow)
+    log_lambda_draws = (
+        post["log_lambda"]
+        .stack(sample=("chain", "draw"))
+        .transpose("puma", "dow", "sample")
+        .values
+    )  # (n_puma, n_dow, S)
+    S = log_lambda_draws.shape[-1]
+
+    # Dispersion alpha_dow(dow)
+    alpha_dow_draws = (
+        post["alpha_dow"]
+        .stack(sample=("chain", "draw"))
+        .transpose("dow", "sample")
+        .values
+    )  # (n_dow, S)
+
+    # Optional year_offset(year)
+    has_year_offset = "year_offset" in post.data_vars
+
+    if has_year_offset:
+        year_offset_draws = (
+            post["year_offset"]
+            .stack(sample=("chain", "draw"))
+            .transpose("year", "sample")
+            .values
+        )  # (n_year, S)
+
+    # Optional day_shock(date)
+    has_day_shock = "day_shock" in post.data_vars
+    if has_day_shock:
+        day_shock_draws = (
+            post["day_shock"]
+            .stack(sample=("chain", "draw"))
+            .transpose("date", "sample")
+            .values
+        )  # (n_date, S)
+
+    # -----------------------------
+    # 4) Build log-mu per row
+    # -----------------------------
+    p_idx = df["puma_idx"].to_numpy()
+    d_idx = df["dow_idx"].to_numpy()
+
+    log_mu = log_lambda_draws[p_idx, d_idx, :]  # (n_rows, S)
+
+    # Add year offset if model has it
+    if has_year_offset:
+        if df["year_idx"].isna().any() or df["year_idx"].iloc[0] is None:
+            if year_fallback == "zero":
+                # missing year -> 0 effect
+                pass
+            else:
+                # If nearest mapping was requested but coords missing, drop those rows
+                df = df[df["year_idx"].notna()].copy()
+                p_idx = df["puma_idx"].to_numpy()
+                d_idx = df["dow_idx"].to_numpy()
+                log_mu = log_lambda_draws[p_idx, d_idx, :]
+
+        if len(df) > 0 and df["year_idx"].notna().all():
+            y_idx = df["year_idx"].astype(int).to_numpy()
+            log_mu = log_mu + year_offset_draws[y_idx, :]
+
+    # Add day shock if model has it
+    if has_day_shock:
+        df = df[df["date_idx"].notna()].copy()
+        p_idx = df["puma_idx"].to_numpy()
+        d_idx = df["dow_idx"].to_numpy()
+        log_mu = log_lambda_draws[p_idx, d_idx, :]
+
+        # re-add year offset if applicable after filtering
+        if has_year_offset and len(df) > 0 and df["year_idx"].notna().all():
+            y_idx = df["year_idx"].astype(int).to_numpy()
+            log_mu = log_mu + year_offset_draws[y_idx, :]
+
+        t_idx = df["date_idx"].astype(int).to_numpy()
+        log_mu = log_mu + day_shock_draws[t_idx, :]
+
+    mu_draws = np.exp(log_mu)
+    df["mu_pred_mean"] = mu_draws.mean(axis=1)
+
+    # alpha per row (based on dow)
+    alpha_draws = alpha_dow_draws[d_idx, :]  # (n_rows, S)
+
+    # -----------------------------
+    # 5) Posterior predictive y draws (NB via Gamma–Poisson)
+    # -----------------------------
+    rng = np.random.default_rng(random_seed)
+
+    rate = alpha_draws / np.clip(mu_draws, 1e-9, None)
+    lam_day = rng.gamma(shape=alpha_draws, scale=1.0 / rate)
+    y_pp = rng.poisson(lam_day)
+
+    lo = (1.0 - hdi_prob) / 2
+    hi = 1.0 - lo
+    df["y_pred_low_90"]  = np.quantile(y_pp, lo, axis=1)
+    df["y_pred_high_90"] = np.quantile(y_pp, hi, axis=1)
+
+    df["within_90_pred"] = (
+        (df["daily_count"] >= df["y_pred_low_90"]) &
+        (df["daily_count"] <= df["y_pred_high_90"])
+    )
+
+    df["error"] = df["daily_count"] - df["mu_pred_mean"]
+    df["abs_error"] = df["error"].abs()
+
+    summary = {
+        "MAE": float(df["abs_error"].mean()),
+        "Median AE": float(df["abs_error"].median()),
+        "90% Coverage (predictive)": float(df["within_90_pred"].mean()),
+        "N_days": int(len(df)),
+        "used_year_offset": bool(has_year_offset),
+        "used_day_shock": bool(has_day_shock),
+    }
+
+    return df, y_pp, summary
+
+
+def crps_from_draws(y_pp, y_obs, *, pair_subsample=256, seed=42):
+    """
+    Approximate CRPS per row using posterior predictive draws.
+
+    y_pp: (N, S) draws
+    y_obs: (N,) observed
+    pair_subsample: use K draws to approximate E|X-X'| term
+    """
+    rng = np.random.default_rng(seed)
+    N, S = y_pp.shape
+    y_obs = np.asarray(y_obs).reshape(-1,)
+
+    # term1 = E|X - y|
+    term1 = np.mean(np.abs(y_pp - y_obs[:, None]), axis=1)
+
+    # term2 = 0.5 * E|X - X'|
+    K = min(pair_subsample, S)
+    idx = rng.choice(S, size=K, replace=False)
+    xs = y_pp[:, idx]  # (N, K)
+
+    # Efficient pairwise absolute differences: sort trick
+    xs_sorted = np.sort(xs, axis=1)
+    # E|X-X'| for sample-based distribution:
+    # 2/(K^2) * sum_{i} (2i-K-1)*x_i  (for sorted x_i), then take abs already via ordering
+    weights = (2*np.arange(1, K+1) - K - 1).astype(float)  # (K,)
+    sum_weighted = np.sum(xs_sorted * weights[None, :], axis=1)
+    e_abs_xx = (2.0 / (K*K)) * sum_weighted
+
+    crps = term1 - 0.5 * e_abs_xx
+    return crps
+
+
+def elpd_from_draws(y_pp, y_obs, *, smoothing=1.0):
+    """
+    Estimate expected log predictive density from posterior predictive draws.
+
+    Uses an empirical pmf from draws with additive smoothing:
+      p(y) = (count(y) + smoothing) / (S + smoothing * (support_size))
+
+    Returns: (elpd_total, elpd_mean, lpd_per_row)
+    """
+    y_obs = np.asarray(y_obs).astype(int)
+    N, S = y_pp.shape
+
+    lpd = np.empty(N, dtype=float)
+
+    for i in range(N):
+        draws = y_pp[i, :].astype(int)
+
+        # empirical counts
+        vals, counts = np.unique(draws, return_counts=True)
+        count_map = dict(zip(vals, counts))
+
+        # define support size as unique vals in draws plus the observed value
+        support_vals = set(vals.tolist() + [int(y_obs[i])])
+        K = len(support_vals)
+
+        c = count_map.get(int(y_obs[i]), 0)
+        p = (c + smoothing) / (S + smoothing * K)
+
+        lpd[i] = np.log(p)
+
+    elpd_total = float(np.sum(lpd))
+    elpd_mean = float(np.mean(lpd))
+    return elpd_total, elpd_mean, lpd
+
+def random_summer_date(year: int) -> str:
+    """
+    Return a random date string (YYYY-MM-DD)
+    between June 1 and August 31 of the given year.
+    """
+
+    start = date(year, 6, 1)
+    end   = date(year, 8, 31)
+
+    span_days = (end - start).days
+    rand_offset = random.randint(0, span_days)
+
+    d = start + timedelta(days=rand_offset)
+    return d.isoformat()
+
+
+
+def summarize_forecast_metrics(
+    df,
+    y_pp,
+    *,
+    level=0.90,
+    crps_pair_subsample=256,
+):
+    y = df["daily_count"].to_numpy()
+    lo = (1.0 - level) / 2
+    hi = 1.0 - lo
+
+    low = np.quantile(y_pp, lo, axis=1)
+    high = np.quantile(y_pp, hi, axis=1)
+    width = high - low
+    coverage = np.mean((y >= low) & (y <= high))
+
+    crps = crps_from_draws(y_pp, y, pair_subsample=crps_pair_subsample)
+    elpd_total, elpd_mean, _ = elpd_from_draws(y_pp, y.astype(int), smoothing=1.0)
+
+    mae = np.mean(np.abs(y - df["mu_pred_mean"].to_numpy())) if "mu_pred_mean" in df else np.nan
+
+    return {
+        "N": int(len(df)),
+        "MAE(mu_pred_mean)": float(mae),
+        f"Coverage@{int(level*100)}": float(coverage),
+        f"Median PI width@{int(level*100)}": float(np.median(width)),
+        "Mean CRPS": float(np.mean(crps)),
+        "Median CRPS": float(np.median(crps)),
+        "ELPD_total (draws)": float(elpd_total),
+        "ELPD_mean (draws)": float(elpd_mean),
+    }
+
+
+def forest_day_puma_intervals(
+    df,
+    date,
+    *,
+    puma_col="puma",
+    date_col="date",
+    obs_col="daily_count",
+    mean_col="mu_pred_mean",
+    lo_col="y_pred_low_90",
+    hi_col="y_pred_high_90",
+    sort_by="abs_error",   # "abs_error", "obs", "mean", "puma"
+    top_n=None,            # set e.g. 30 for readability
+    title=None,
+):
+    """
+    Forest-style plot for one date: each PUMA is a row with 90% PI + mean + observed.
+    Requires df to already contain mean + interval columns for that day.
+    """
+
+    d = df.copy()
+    d[date_col] = pd.to_datetime(d[date_col]).dt.normalize()
+    target = pd.to_datetime(date).normalize()
+
+    day = d.loc[d[date_col] == target].copy()
+    if day.empty:
+        raise ValueError(f"No rows found for {date_col} == {target.date()}")
+
+    # Ensure puma string for labeling
+    day[puma_col] = day[puma_col].astype(str).str.strip()
+
+    # Basic checks
+    needed = [puma_col, obs_col, mean_col, lo_col, hi_col]
+    missing = [c for c in needed if c not in day.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    # Compute errors for sorting/annotation
+    day["error"] = day[obs_col] - day[mean_col]
+    day["abs_error"] = day["error"].abs()
+    day["pi_width"] = day[hi_col] - day[lo_col]
+
+    # Sort
+    if sort_by == "abs_error":
+        day = day.sort_values("abs_error", ascending=False)
+    elif sort_by == "obs":
+        day = day.sort_values(obs_col, ascending=False)
+    elif sort_by == "mean":
+        day = day.sort_values(mean_col, ascending=False)
+    elif sort_by == "puma":
+        day = day.sort_values(puma_col, ascending=True)
+
+    # Optionally reduce rows
+    if top_n is not None:
+        day = day.head(int(top_n)).copy()
+
+    # Plot positions
+    y = np.arange(len(day))
+
+    plt.figure(figsize=(10, max(4, 0.28 * len(day))))
+
+    # Interval as horizontal line segments
+    plt.hlines(
+        y=y,
+        xmin=day[lo_col].to_numpy(),
+        xmax=day[hi_col].to_numpy(),
+        linewidth=2,
+        alpha=0.9,
+        label="90% predictive interval",
+    )
+
+    # Predicted mean as point
+    plt.scatter(
+        day[mean_col].to_numpy(),
+        y,
+        s=35,
+        marker="o",
+        label="pred mean",
+    )
+
+    # Observed as x marker
+    plt.scatter(
+        day[obs_col].to_numpy(),
+        y,
+        s=35,
+        marker="x",
+        label="observed",
+    )
+
+    # Label y-axis with PUMA codes
+    plt.yticks(y, day[puma_col].tolist())
+    plt.gca().invert_yaxis()
+
+    # Helpful title
+    if title is None:
+        title = f"Model intervals by PUMA on {target.date()}"
+
+    plt.title(title)
+    plt.xlabel("Daily complaints")
+    plt.ylabel("PUMA")
+
+    # Optional: vertical line at 0 isn't useful here; instead add legend & grid
+    plt.grid(axis="x", alpha=0.25)
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.show()
+
+    return day  # returns the filtered/sorted table for inspection
+
+
+def inspect_puma_day(df, puma, date):
+    d = df.copy()
+    d["puma"] = d["puma"].astype(str).str.strip()
+    d["date"] = pd.to_datetime(d["date"]).dt.normalize()
+
+    puma = str(puma).strip()
+    date = pd.to_datetime(date).normalize()
+
+    row = d.loc[(d["puma"] == puma) & (d["date"] == date)].copy()
+    if row.empty:
+        raise ValueError(f"No rows found for puma={puma} on date={date.date()}")
+
+    # If multiple rows, keep them (could happen if you have multiple complaint types)
+    # but usually it should be 1 row.
+    cols = [c for c in [
+        "puma","date","dow","daily_count","mu_pred_mean","y_pred_low_90","y_pred_high_90"
+    ] if c in row.columns]
+    print(row[cols])
+
+    if "mu_pred_mean" in row.columns:
+        row["error_mu"] = row["daily_count"] - row["mu_pred_mean"]
+        row["abs_error_mu"] = row["error_mu"].abs()
+
+    if {"y_pred_low_90","y_pred_high_90"}.issubset(row.columns):
+        row["within_90_pred"] = (
+            (row["daily_count"] >= row["y_pred_low_90"]) &
+            (row["daily_count"] <= row["y_pred_high_90"])
+        )
+
+    return row
+
+def plot_puma_day_interval(df, puma, date):
+    r = inspect_puma_day(df, puma, date)
+
+    # If multiple rows exist, just plot the first one
+    rr = r.iloc[0]
+
+    y = float(rr["daily_count"])
+    mu = float(rr["mu_pred_mean"]) if "mu_pred_mean" in rr else np.nan
+    lo = float(rr["y_pred_low_90"]) if "y_pred_low_90" in rr else np.nan
+    hi = float(rr["y_pred_high_90"]) if "y_pred_high_90" in rr else np.nan
+
+    plt.figure(figsize=(7, 1.8))
+    # Interval
+    if np.isfinite(lo) and np.isfinite(hi):
+        plt.hlines(0, lo, hi, linewidth=6, alpha=0.7, label="90% predictive interval")
+        plt.scatter([lo, hi], [0, 0], s=30)
+
+    # Mean
+    if np.isfinite(mu):
+        plt.scatter([mu], [0], s=90, marker="|", label="pred mean (mu_pred_mean)")
+
+    # Observed
+    plt.scatter([y], [0], s=80, label="observed (daily_count)")
+
+    plt.yticks([])
+    plt.xlabel("complaints")
+    plt.title(f"PUMA {str(puma)} on {pd.to_datetime(date).date()}  |  error={y-mu:.2f}")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.show()
+
+def normalize_summary_for_comparison(summary: dict, *, model_label: str) -> dict:
+    """
+    Normalize heterogeneous model summaries into a comparable schema.
+    """
+
+    out = {
+        "Model": model_label,
+        "N": summary.get("N"),
+        "Point MAE": np.nan,
+        "Point Median AE": np.nan,
+        "Coverage@90": np.nan,
+        "Median Interval Width@90": np.nan,
+        "Mean Interval Width@90": np.nan,
+        "Interval Type": None,
+    }
+
+    # Point error
+    for k in summary:
+        if k.startswith("MAE"):
+            out["Point MAE"] = summary[k]
+        if k.startswith("Median AE"):
+            out["Point Median AE"] = summary[k]
+
+    # Interval coverage
+    for k in summary:
+        if k.startswith("90% Coverage"):
+            out["Coverage@90"] = summary[k]
+            out["Interval Type"] = "predictive" if "predictive" in k else "rate"
+
+    # Interval width
+    for k in summary:
+        if k.startswith("Median") and "interval width" in k:
+            out["Median Interval Width@90"] = summary[k]
+        if k.startswith("Mean") and "interval width" in k:
+            out["Mean Interval Width@90"] = summary[k]
+
+    return out
+
+
+
+def rebuild_daily_cmp_2025_model4(
+    *,
+    daily_2025: pd.DataFrame,      # must have puma,dow,date,daily_count
+    idata,                         # fitted PyMC InferenceData
+    coords: dict,                  # training coords (must include puma,dow)
+    df_forecast_week: pd.DataFrame | None = None,  # optional baseline
+    puma_col: str = "puma",
+    dow_col: str = "dow",
+    date_col: str = "date",
+    y_col: str = "daily_count",
+    seed: int = 42,
+    hdi_prob: float = 0.90,
+):
+    """
+    Rebuild daily_cmp_2025_model4 using posterior draws:
+      log_lambda[puma,dow] (required) and alpha_dow[dow] OR alpha (required).
+
+    Returns:
+      daily_cmp_2025_model4 (DataFrame),
+      y_pp_model4 (ndarray: (n_rows, S))
+    """
+
+    # -----------------------------
+    # 0) Copy + normalize types
+    # -----------------------------
+    df = daily_2025.copy()
+    df[puma_col] = df[puma_col].astype(str).str.strip()
+    df[dow_col] = df[dow_col].astype(str)
+    df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
+
+    # -----------------------------
+    # 1) Optional: merge baseline forecast (weekday mean)
+    # -----------------------------
+    if df_forecast_week is not None:
+        fw = df_forecast_week.copy()
+        fw[puma_col] = fw[puma_col].astype(str).str.strip()
+        fw[dow_col] = fw[dow_col].astype(str)
+        df = df.merge(fw, on=[puma_col, dow_col], how="left")
+
+    # -----------------------------
+    # 2) Build index maps from training coords
+    # -----------------------------
+    puma_to_idx = {str(p): i for i, p in enumerate(coords["puma"])}
+    dow_to_idx = {str(d): i for i, d in enumerate(coords["dow"])}
+
+    df["puma_idx"] = df[puma_col].map(puma_to_idx)
+    df["dow_idx"] = df[dow_col].map(dow_to_idx)
+
+    # Keep only rows that exist in training coords
+    df = df.dropna(subset=["puma_idx", "dow_idx"]).copy()
+    df["puma_idx"] = df["puma_idx"].astype(int)
+    df["dow_idx"] = df["dow_idx"].astype(int)
+
+    # -----------------------------
+    # 3) Pull posterior draws
+    # -----------------------------
+    post = idata.posterior
+
+    if "log_lambda" not in post:
+        raise KeyError("posterior must contain 'log_lambda' with dims ('puma','dow').")
+
+    # (puma, dow, sample)
+    log_lambda_draws = (
+        post["log_lambda"]
+        .stack(sample=("chain", "draw"))
+        .transpose("puma", "dow", "sample")
+        .values
+    )
+    mu_grid_draws = np.exp(log_lambda_draws)  # mu = exp(log_lambda)
+
+    # Alpha handling: alpha_dow preferred, else alpha
+    if "alpha_dow" in post:
+        alpha_dow = (
+            post["alpha_dow"]
+            .stack(sample=("chain", "draw"))
+            .transpose("dow", "sample")
+            .values
+        )  # (dow, S)
+        alpha_mode = "alpha_dow"
+    elif "alpha" in post:
+        alpha = post["alpha"].stack(sample=("chain", "draw")).values  # (S,)
+        alpha_mode = "alpha"
+    else:
+        raise KeyError("posterior must contain 'alpha_dow' or 'alpha'.")
+
+    # -----------------------------
+    # 4) Select draws per row
+    # -----------------------------
+    p_idx = df["puma_idx"].to_numpy()
+    d_idx = df["dow_idx"].to_numpy()
+
+    mu_draws = mu_grid_draws[p_idx, d_idx, :]   # (n_rows, S)
+    df["mu_pred_mean"] = mu_draws.mean(axis=1)
+
+    if alpha_mode == "alpha_dow":
+        alpha_row = alpha_dow[d_idx, :]         # (n_rows, S)
+    else:
+        alpha_row = alpha[None, :]              # (1, S) broadcast to (n_rows, S)
+
+    # -----------------------------
+    # 5) Posterior predictive sampling (NegBin via Gamma–Poisson mix)
+    # -----------------------------
+    rng = np.random.default_rng(seed)
+
+    # rate parameter for gamma: rate = alpha / mu  (shape=alpha, scale=mu/alpha)
+    rate = alpha_row / np.clip(mu_draws, 1e-9, None)
+    lam_day = rng.gamma(shape=alpha_row, scale=1.0 / rate)  # (n_rows, S)
+    y_pp_model4 = rng.poisson(lam_day)                      # (n_rows, S)
+
+    # -----------------------------
+    # 6) Predictive intervals + coverage
+    # -----------------------------
+    q_lo = (1.0 - hdi_prob) / 2.0
+    q_hi = 1.0 - q_lo
+
+    df["y_pred_low_90"]  = np.quantile(y_pp_model4, q_lo, axis=1)
+    df["y_pred_high_90"] = np.quantile(y_pp_model4, q_hi, axis=1)
+
+    y_obs = df[y_col].to_numpy()
+
+    df["within_90_pred"] = (y_obs >= df["y_pred_low_90"]) & (y_obs <= df["y_pred_high_90"])
+
+    # -----------------------------
+    # 7) Errors
+    # -----------------------------
+    df["error_mu"] = y_obs - df["mu_pred_mean"]
+    df["abs_error_mu"] = np.abs(df["error_mu"])
+
+    # Optional baseline error if lam_forecast exists
+    if "lam_forecast" in df.columns:
+        df["error_lam_forecast"] = y_obs - df["lam_forecast"]
+        df["abs_error_lam_forecast"] = np.abs(df["error_lam_forecast"])
+
+    return df, y_pp_model4
