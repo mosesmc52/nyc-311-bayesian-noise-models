@@ -811,7 +811,7 @@ def score_predictions(y_true: np.ndarray, y_pred_mean: np.ndarray):
     return {"mae": float(mae), "rmse": float(rmse)}
 
 
-def make_typical_week_2025(df_2025, *, complaint_col="descriptor_group"):
+def make_typical_week_2025(df_2025, *, complaint_col="descriptor_group", months = [6, 7, 8]):
     x = df_2025.copy()
     x["created_bucket"] = pd.to_datetime(x["created_bucket"], errors="coerce")
     x = x[x["created_bucket"].notna()].copy()
@@ -819,7 +819,7 @@ def make_typical_week_2025(df_2025, *, complaint_col="descriptor_group"):
     # summer 2025 only
     x = x[
         (x["created_bucket"].dt.year == 2025) &
-        (x["created_bucket"].dt.month.isin([6, 7, 8]))
+        (x["created_bucket"].dt.month.isin(months))
     ].copy()
 
     x["date"] = x["created_bucket"].dt.normalize()
@@ -847,32 +847,41 @@ def make_daily_observed_2025(
     complaint_col="descriptor_group",
 ):
     x = df_2025.copy()
+
+    # --- Clean timestamps ---
     x["created_bucket"] = pd.to_datetime(x["created_bucket"], errors="coerce")
     x = x[x["created_bucket"].notna()].copy()
 
-    # Summer 2025 filter
+    # --- Summer 2025 filter ---
     x = x[
         (x["created_bucket"].dt.year == 2025) &
         (x["created_bucket"].dt.month.isin([6, 7, 8]))
     ].copy()
 
+    # --- Optional complaint filter ---
     if complaint_value is not None:
         x = x[x[complaint_col].astype(str) == str(complaint_value)].copy()
 
+    # --- Date engineering ---
     x["date"] = x["created_bucket"].dt.normalize()
     x["dow"] = x["date"].dt.day_name()
-    x["puma"] = x["puma"].astype(str).str.strip()
 
+    # --- Clean geographic keys ---
+    x["puma"] = x["puma"].astype(str).str.strip()
+    x["nta_puma"] = x["nta_puma"].astype(str).str.strip()
+
+    # --- Aggregate ---
     daily_obs = (
-        x.groupby(["puma", "date", "dow"], as_index=False)["complaint_count"]
+        x.groupby(["puma", "nta_puma", "date", "dow"], as_index=False)["complaint_count"]
          .sum()
          .rename(columns={"complaint_count": "daily_count"})
     )
 
-    # ensure datetime64[ns]
+    # Ensure datetime64[ns]
     daily_obs["date"] = pd.to_datetime(daily_obs["date"]).astype("datetime64[ns]")
 
     return daily_obs
+
 
 def plot_coverage_curve(
     y_obs: np.ndarray,
@@ -1547,3 +1556,89 @@ def rebuild_daily_cmp_2025_model4(
         df["abs_error_lam_forecast"] = np.abs(df["error_lam_forecast"])
 
     return df, y_pp_model4
+
+
+def summarize_model_performance(df: pd.DataFrame) -> dict:
+    """
+    Summarize model performance.
+
+    Supports:
+    - Poisson / typical-week outputs:
+        observed_2025, lam_forecast, lam_low_90, lam_high_90
+    - NB daily predictive outputs:
+        daily_count, mu_pred_mean, y_pred_low_90, y_pred_high_90
+
+    Returns metrics for:
+    - Point accuracy (MAE, Median AE)
+    - Interval coverage
+    - Interval width
+    """
+
+    # -----------------------------
+    # Observed values
+    # -----------------------------
+    if "daily_count" in df.columns:
+        y_obs = df["daily_count"].to_numpy()
+    elif "observed_2025" in df.columns:
+        y_obs = df["observed_2025"].to_numpy()
+    else:
+        raise KeyError("Need 'daily_count' or 'observed_2025'.")
+
+    # -----------------------------
+    # Point prediction
+    # -----------------------------
+    if "mu_pred_mean" in df.columns:
+        y_hat = df["mu_pred_mean"].to_numpy()
+        pred_label = "mu_pred_mean"
+    elif "lam_forecast" in df.columns:
+        y_hat = df["lam_forecast"].to_numpy()
+        pred_label = "lam_forecast"
+    else:
+        raise KeyError("Need 'mu_pred_mean' or 'lam_forecast'.")
+
+    abs_err = np.abs(y_obs - y_hat)
+
+    # -----------------------------
+    # Interval selection
+    # -----------------------------
+    interval_type = None
+
+    if {"y_pred_low_90", "y_pred_high_90"}.issubset(df.columns):
+        lo = df["y_pred_low_90"].to_numpy()
+        hi = df["y_pred_high_90"].to_numpy()
+        interval_type = "predictive"
+    elif {"lam_low_90", "lam_high_90"}.issubset(df.columns):
+        lo = df["lam_low_90"].to_numpy()
+        hi = df["lam_high_90"].to_numpy()
+        interval_type = "lam"
+    else:
+        lo = hi = None
+
+    # -----------------------------
+    # Coverage + width
+    # -----------------------------
+    if lo is not None:
+        coverage = np.mean((y_obs >= lo) & (y_obs <= hi))
+        width = hi - lo
+        width_mean = float(np.mean(width))
+        width_median = float(np.median(width))
+    else:
+        coverage = np.nan
+        width_mean = np.nan
+        width_median = np.nan
+
+    # -----------------------------
+    # Assemble results
+    # -----------------------------
+    out = {
+        "N": int(len(df)),
+        f"MAE ({pred_label})": float(np.mean(abs_err)),
+        f"Median AE ({pred_label})": float(np.median(abs_err)),
+    }
+
+    if interval_type is not None:
+        out[f"90% Coverage ({interval_type} interval)"] = float(coverage)
+        out[f"Median {interval_type} interval width (90%)"] = width_median
+        out[f"Mean {interval_type} interval width (90%)"] = width_mean
+
+    return out
