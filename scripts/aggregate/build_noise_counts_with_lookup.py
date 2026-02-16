@@ -647,7 +647,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--format",
-        default=["csv"],
+        default=["csv", "parquet"],
         action="append",
         choices=["csv", "parquet"],
         help="Output format(s). Provide one or both: --format csv --format parquet",

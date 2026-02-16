@@ -15,6 +15,7 @@ jupyterlab = "^4.5.3"
 pymc = "5.25.1"
 seaborn = "^0.13.2"
 geopandas = "^1.1.2"
+keplergl = "^0.3.7"
 
 
 [build-system]
