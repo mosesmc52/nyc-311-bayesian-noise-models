@@ -1422,7 +1422,7 @@ def normalize_summary_for_comparison(summary: dict, *, model_label: str) -> dict
 
 
 
-def rebuild_daily_cmp_2025_model4(
+def rebuild_daily_cmp_2025_model3(
     *,
     daily_2025: pd.DataFrame,      # must have puma,dow,date,daily_count
     idata,                         # fitted PyMC InferenceData
@@ -1436,12 +1436,12 @@ def rebuild_daily_cmp_2025_model4(
     hdi_prob: float = 0.90,
 ):
     """
-    Rebuild daily_cmp_2025_model4 using posterior draws:
+    Rebuild daily_cmp_2025_model3 using posterior draws:
       log_lambda[puma,dow] (required) and alpha_dow[dow] OR alpha (required).
 
     Returns:
-      daily_cmp_2025_model4 (DataFrame),
-      y_pp_model4 (ndarray: (n_rows, S))
+      daily_cmp_2025_model3 (DataFrame),
+      y_pp_model3 (ndarray: (n_rows, S))
     """
 
     # -----------------------------
@@ -1529,7 +1529,7 @@ def rebuild_daily_cmp_2025_model4(
     # rate parameter for gamma: rate = alpha / mu  (shape=alpha, scale=mu/alpha)
     rate = alpha_row / np.clip(mu_draws, 1e-9, None)
     lam_day = rng.gamma(shape=alpha_row, scale=1.0 / rate)  # (n_rows, S)
-    y_pp_model4 = rng.poisson(lam_day)                      # (n_rows, S)
+    y_pp_model3 = rng.poisson(lam_day)                      # (n_rows, S)
 
     # -----------------------------
     # 6) Predictive intervals + coverage
@@ -1537,8 +1537,8 @@ def rebuild_daily_cmp_2025_model4(
     q_lo = (1.0 - hdi_prob) / 2.0
     q_hi = 1.0 - q_lo
 
-    df["y_pred_low_90"]  = np.quantile(y_pp_model4, q_lo, axis=1)
-    df["y_pred_high_90"] = np.quantile(y_pp_model4, q_hi, axis=1)
+    df["y_pred_low_90"]  = np.quantile(y_pp_model3, q_lo, axis=1)
+    df["y_pred_high_90"] = np.quantile(y_pp_model3, q_hi, axis=1)
 
     y_obs = df[y_col].to_numpy()
 
@@ -1555,7 +1555,7 @@ def rebuild_daily_cmp_2025_model4(
         df["error_lam_forecast"] = y_obs - df["lam_forecast"]
         df["abs_error_lam_forecast"] = np.abs(df["error_lam_forecast"])
 
-    return df, y_pp_model4
+    return df, y_pp_model3
 
 
 def summarize_model_performance(df: pd.DataFrame) -> dict:
