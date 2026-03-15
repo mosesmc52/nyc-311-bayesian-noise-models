@@ -59,7 +59,7 @@ import pandas as pd
 DEFAULT_NOISE_CSV_PATH = "./data/raw/nyc/311_noise/by_month"
 DEFAULT_PUMA_GEOJSON_PATH = "./data/raw/nyc/geographies/nyc_pumas_2020.geojson"
 DEFUALT_NTA_GEOJSON_PATH = "./data/raw/nyc/geographies/nyc_ntas_2020.geojson"
-DEFAULT_LOOKUP_CSV = "./data/processed/lookup/puma_nta_lookup.csv"
+DEFAULT_LOOKUP_CSV = "./data/processed/lookup/puma_nta_lookup.parquet"
 OUTPUT_DIR = "data/processed/features"
 
 
