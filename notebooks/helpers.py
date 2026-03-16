@@ -130,32 +130,7 @@ def export_puma_kepler(
 ) -> gpd.GeoDataFrame:
     """
     Merge an aggregated dataframe with PUMA polygons and export a Kepler-ready GeoJSON.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Aggregated data with a PUMA identifier column.
-    puma_geojson_path : str
-        Path to PUMA GeoJSON file.
-    puma_key : str, default="puma"
-        Column name in df containing PUMA ids.
-    geo_puma_col : str, default="PUMA"
-        Column name in the GeoJSON containing PUMA ids.
-    value_cols : list[str], optional
-        Columns to fill missing values for (e.g. ["typical_daily_count"]).
-        If None, no filling is applied.
-    fill_value : float or int or None, default=0
-        Value to use for filling missing entries in value_cols.
-        Set to None to skip filling.
-    out_path : str or Path
-        Output GeoJSON path.
-    crs : str, default="EPSG:4326"
-        Target CRS for Kepler.gl.
-
-    Returns
-    -------
-    gpd.GeoDataFrame
-        Kepler-ready GeoDataFrame.
+    Numeric value columns are rounded to the nearest .001 for cleaner visualization.
     """
 
     # Load geometry
@@ -178,6 +153,12 @@ def export_puma_kepler(
         for col in value_cols:
             if col in gdf.columns:
                 gdf[col] = gdf[col].fillna(fill_value)
+
+    # Round numeric metric columns to 3 decimals
+    if value_cols:
+        for col in value_cols:
+            if col in gdf.columns:
+                gdf[col] = pd.to_numeric(gdf[col], errors="coerce").round(3)
 
     # Ensure output directory exists
     out_path = Path(out_path)
@@ -281,16 +262,18 @@ def build_typical_week_city_relative_ratio(
     created_col: str = "created_bucket",
     puma_col: str = "puma",
     count_col: str = "complaint_count",
-    complaint_col: str = "descriptor_group",  #  preferred
+    complaint_col: str = "descriptor_group",
+    nta_puma_col: str = "nta_puma",   # new
     months: tuple[int, ...] = (6, 7, 8),
-    agg: str = "median",               # "median" or "mean"
+    agg: str = "median",
     synthetic_week_year: int = 2000,
 ) -> pd.DataFrame:
     """
     Ratio of PUMA's typical weekday complaint count
     to the citywide average for that weekday.
 
-    Returns one row per (puma, complaint, dow).
+    Returns one row per (puma, complaint, dow), while also carrying
+    an nta_puma display label when available.
     """
 
     out = df.copy()
@@ -312,9 +295,16 @@ def build_typical_week_city_relative_ratio(
     out[puma_col] = out[puma_col].astype(str).str.strip()
     out[complaint_col] = out[complaint_col].astype(str).str.strip()
 
+    if nta_puma_col in out.columns:
+        out[nta_puma_col] = out[nta_puma_col].astype(str).str.strip()
+
     # 4) daily totals
+    group_cols = [puma_col, "date", complaint_col, "dow"]
+    if nta_puma_col in out.columns:
+        group_cols.append(nta_puma_col)
+
     daily = (
-        out.groupby([puma_col, "date", complaint_col, "dow"], as_index=False)[count_col]
+        out.groupby(group_cols, as_index=False)[count_col]
            .sum()
            .rename(columns={
                puma_col: "puma",
@@ -324,10 +314,14 @@ def build_typical_week_city_relative_ratio(
     )
 
     # 5) typical weekday (median or mean)
+    typical_group_cols = ["puma", "complaint", "dow"]
+    if nta_puma_col in daily.columns:
+        typical_group_cols.append(nta_puma_col)
+
     if agg == "median":
-        typical = daily.groupby(["puma", "complaint", "dow"], as_index=False)["daily_count"].median()
+        typical = daily.groupby(typical_group_cols, as_index=False)["daily_count"].median()
     else:
-        typical = daily.groupby(["puma", "complaint", "dow"], as_index=False)["daily_count"].mean()
+        typical = daily.groupby(typical_group_cols, as_index=False)["daily_count"].mean()
 
     typical = typical.rename(columns={"daily_count": "typical_daily_count"})
 
@@ -690,64 +684,106 @@ def plot_topn_shrinkage_vs_raw(
 
 
 
-def plot_topn_absdiff(
-    cmp: pd.DataFrame,
-    *,
-    n: int = 10,
-    raw_col: str = "city_weekday_mean",
-    post_mean_col: str = "lam_mean",
-    absdiff_col: str = "abs_diff",
-    width_col: str = "lam_width_90",
-    label_col: str = "nta_puma",   # <-- NEW
+
+
+import matplotlib.pyplot as plt
+
+
+def plot_puma_model_vs_observed(
+    df,
+    dow,
+    segment="top",
+    n=20,
+    sort_by="lam_mean",
+    figsize=(10, 12)
 ):
-    # --- ensure we have a clean label column ---
-    if label_col not in cmp.columns:
-        # common case: pandas suffixes after merges
-        if f"{label_col}_x" in cmp.columns or f"{label_col}_y" in cmp.columns:
-            cmp = cmp.copy()
-            cmp[label_col] = cmp.get(f"{label_col}_x")
-            if f"{label_col}_y" in cmp.columns:
-                cmp[label_col] = cmp[label_col].fillna(cmp[f"{label_col}_y"])
-        else:
-            raise KeyError(
-                f"'{label_col}' not found in cmp. "
-                f"Available label-like cols: {[c for c in cmp.columns if 'nta' in c or 'puma' in c]}"
-            )
+    """
+    Plot Bayesian model estimates vs observed complaint means.
 
-    cols = [label_col, "puma", "dow", raw_col, post_mean_col, absdiff_col, width_col]
-    top = make_topn_table(cmp, sort_by=absdiff_col, ascending=False, n=n, cols=cols)
+    Parameters
+    ----------
+    df : DataFrame
+        Dataframe containing model and observed metrics
+    dow : str
+        Weekday to visualize
+    segment : str
+        'top', 'mid', or 'bottom'
+    n : int
+        Number of PUMAs to display
+    sort_by : str
+        Column used to rank rows ("lam_mean" or "mean_complaint_count")
+    figsize : tuple
+        Matplotlib figure size
+    """
 
-    # Override y-axis label to use nta_puma for readability
-    top["label"] = top[label_col].astype(str) + " | " + top["dow"].astype(str)
+    df_plot = df[df["dow"] == dow].copy()
 
-    # Signed delta is more informative than abs_diff for a plot
-    delta = top[post_mean_col] - top[raw_col]
-    y = np.arange(len(top))
+    df_plot = df_plot.sort_values(sort_by)
 
-    plt.figure(figsize=(10, 6))
-    plt.barh(
+    total = len(df_plot)
+
+    if segment == "top":
+        df_plot = df_plot.tail(n)
+
+    elif segment == "bottom":
+        df_plot = df_plot.head(n)
+
+    elif segment == "mid":
+        mid = total // 2
+        half = n // 2
+        df_plot = df_plot.iloc[mid - half: mid + half]
+
+    else:
+        raise ValueError("segment must be 'top', 'mid', or 'bottom'")
+
+    df_plot = df_plot.sort_values(sort_by)
+
+    y = range(len(df_plot))
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # credible intervals
+    ax.hlines(
         y=y,
-        width=delta,
-        alpha=0.8,
-        label="Posterior − raw",
+        xmin=df_plot["lam_low_90"],
+        xmax=df_plot["lam_high_90"],
+        color="steelblue",
+        lw=2
     )
-    plt.axvline(0, linewidth=1)
-    plt.yticks(y, top["label"])
-    plt.xlabel("Δ typical daily count (posterior − raw)")
-    plt.title(f"Top {n} biggest absolute differences (with interval width as context)")
-    plt.grid(axis="x", alpha=0.3)
 
-    # Annotate with abs_diff and interval width (keeps it interpretable)
-    for i, (d, ad, w) in enumerate(zip(delta, top[absdiff_col], top[width_col])):
-        txt = f"|Δ|={ad:.2f}, w90={w:.2f}"
-        # place text slightly to the right/left of bar end
-        x = d + (0.02 * (abs(d) + 1)) if d >= 0 else d - (0.02 * (abs(d) + 1))
-        plt.text(x, i, txt, va="center")
+    # model mean
+    ax.scatter(
+        df_plot["lam_mean"],
+        y,
+        color="steelblue",
+        s=60,
+        label="Model Mean"
+    )
+
+    # observed mean
+    ax.scatter(
+        df_plot["mean_complaint_count"],
+        y,
+        marker="x",
+        color="darkorange",
+        s=70,
+        label="Observed Mean"
+    )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(df_plot["nta_puma_x"])
+
+    ax.set_xlabel("Daily Complaint Rate")
+
+    ax.set_title(f"Model vs Observed Noise Complaints ({dow} • {segment.upper()})")
+
+    ax.grid(True, axis="x", alpha=0.3)
+
+    ax.legend()
 
     plt.tight_layout()
-    plt.show()
 
-    return top
+    return fig, ax
 
 
 
