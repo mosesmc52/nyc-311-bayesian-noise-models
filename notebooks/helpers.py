@@ -1457,6 +1457,31 @@ def normalize_summary_for_comparison(summary: dict, *, model_label: str) -> dict
     return out
 
 
+def summarize_lam_posterior(idata, value_name):
+    lam_post = idata.posterior["lam"]
+
+    mean_df = (
+        lam_post
+        .mean(dim=("chain", "draw"))
+        .to_dataframe(name=value_name)
+        .reset_index()
+    )
+
+    hdi_df = (
+        az.hdi(lam_post, hdi_prob=0.90)["lam"]
+        .to_dataframe(name="lam_hdi")
+        .reset_index()
+        .pivot_table(index=["puma", "dow"], columns="hdi", values="lam_hdi")
+        .reset_index()
+        .rename(columns={
+            "lower": f"{value_name}_low_90",
+            "higher": f"{value_name}_high_90",
+        })
+    )
+
+    out = mean_df.merge(hdi_df, on=["puma", "dow"], how="left")
+    out[f"{value_name}_width_90"] = out[f"{value_name}_high_90"] - out[f"{value_name}_low_90"]
+    return out
 
 def rebuild_daily_cmp_2025_model3(
     *,
