@@ -6,6 +6,7 @@ from pathlib import Path
 import geopandas as gpd
 import arviz as az
 import matplotlib.pyplot as plt
+from IPython.display import display
 
 # =========================================================
 # NEW: Aggregate descriptors into higher-level categories
@@ -169,92 +170,6 @@ def export_puma_kepler(
 
     return gdf
 
-
-# Combined label for filtering (complaint__dow)
-def slug(s: str) -> str:
-    return (
-        str(s).upper()
-        .replace("/", " ")
-        .replace(",", " ")
-        .replace(":", " ")
-        .replace("-", " ")
-    )
-
-
-def build_typical_week_counts(
-    df: pd.DataFrame,
-    *,
-    complaint_col: str = "descriptor_group",   # or "descriptor"
-    months: tuple[int, ...] = (6, 7, 8),
-    agg: str = "median",  # "median" or "mean"
-) -> pd.DataFrame:
-    """
-    Returns one row per (puma, complaint, dow) with typical_daily_count,
-    plus a synthetic 'date' column for Kepler animation and a dow_complaint label.
-    """
-
-    out = df.copy()
-
-    # Ensure types
-    out["created_bucket"] = pd.to_datetime(out["created_bucket"], errors="coerce")
-    out = out[out["created_bucket"].notna()].copy()
-
-    # Summer-only
-    out = out[out["created_bucket"].dt.month.isin(months)].copy()
-
-    out["puma"] = out["puma"].astype(str).str.strip()
-    out[complaint_col] = out[complaint_col].astype(str).str.strip()
-
-    # Daily totals per (puma, date, complaint)
-    out["date"] = out["created_bucket"].dt.normalize()
-    out["dow"] = out["date"].dt.day_name()
-
-    daily = (
-        out.groupby(["puma", "date", complaint_col, "dow"], as_index=False)["complaint_count"]
-           .sum()
-           .rename(columns={"complaint_count": "daily_count", complaint_col: "complaint"})
-    )
-
-    # Typical-week aggregation across summer days
-    if agg == "median":
-        typical = (
-            daily.groupby(["puma", "complaint", "dow"], as_index=False)["daily_count"]
-                 .median()
-                 .rename(columns={"daily_count": "typical_daily_count"})
-        )
-    elif agg == "mean":
-        typical = (
-            daily.groupby(["puma", "complaint", "dow"], as_index=False)["daily_count"]
-                 .mean()
-                 .rename(columns={"daily_count": "typical_daily_count"})
-        )
-    else:
-        raise ValueError("agg must be 'median' or 'mean'")
-
-    # Synthetic dates for Kepler animation
-    dow_to_date = {
-        "Monday":    "2000-01-03",
-        "Tuesday":   "2000-01-04",
-        "Wednesday": "2000-01-05",
-        "Thursday":  "2000-01-06",
-        "Friday":    "2000-01-07",
-        "Saturday":  "2000-01-08",
-        "Sunday":    "2000-01-09",
-    }
-    typical["date"] = pd.to_datetime(typical["dow"].map(dow_to_date), errors="coerce").astype("datetime64[ns]")
-
-
-    typical["dow_complaint"] = (
-        typical["complaint"].map(slug)
-        .astype(str)
-        .replace({r"\s+": " "}, regex=True)
-        .str.strip()
-        .str.replace(" ", "_")
-        + "__"
-        + typical["dow"].astype(str)
-    )
-
-    return typical
 
 def build_typical_week_city_relative_ratio(
     df: pd.DataFrame,
@@ -487,47 +402,6 @@ def make_daily_table_for_model_with_nta(
     return daily_df, coords
 
 
-def extract_weekday(s: str) -> str:
-    return str(s).split("__")[-1]
-
-def add_typical_week_date_from_dow_complaint(
-    df: pd.DataFrame,
-    *,
-    dow_complaint_col: str = "dow_complaint",
-    weekday_col: str = "weekday",
-    date_col: str = "date",
-) -> pd.DataFrame:
-    """
-    Add weekday + synthetic date columns derived from dow_complaint.
-
-    Assumes dow_complaint format: <SOMETHING>__<Weekday>
-
-    Returns a COPY of df with:
-      - weekday (Monday..Sunday)
-      - date (synthetic datetime64 for Kepler animation)
-    """
-
-    dow_to_date = {
-        "Monday":    "2000-01-03",
-        "Tuesday":   "2000-01-04",
-        "Wednesday": "2000-01-05",
-        "Thursday":  "2000-01-06",
-        "Friday":    "2000-01-07",
-        "Saturday":  "2000-01-08",
-        "Sunday":    "2000-01-09",
-    }
-
-    out = df.copy()
-
-    out[weekday_col] = out[dow_complaint_col].map(extract_weekday)
-
-    out[date_col] = (
-        pd.to_datetime(out[weekday_col].map(dow_to_date), errors="coerce")
-        .astype("datetime64[ns]")
-    )
-
-    return out
-
 def kepler_typical_week_from_dow_complaint(
     df: pd.DataFrame,
     *,
@@ -606,81 +480,6 @@ def make_topn_table(
     df = df.iloc[::-1].reset_index(drop=True)
     return df
 
-
-# ----------------------------
-# Plot 1: raw baseline vs posterior + interval (shrinkage-style)
-# ----------------------------
-def plot_topn_shrinkage_vs_raw(
-    cmp: pd.DataFrame,
-    *,
-    sort_by: str = "city_weekday_mean",
-    n: int = 10,
-    raw_col: str = "city_weekday_mean",
-    post_mean_col: str = "lam_mean",
-    post_low_col: str = "lam_low_90",
-    post_high_col: str = "lam_high_90",
-    label_col: str = "nta_puma",   # <-- NEW
-):
-    # --- ensure we have a clean label column ---
-    if label_col not in cmp.columns:
-        # common case: pandas suffixes after merges
-        if f"{label_col}_x" in cmp.columns or f"{label_col}_y" in cmp.columns:
-            cmp = cmp.copy()
-            cmp[label_col] = cmp.get(f"{label_col}_x")
-            if f"{label_col}_y" in cmp.columns:
-                cmp[label_col] = cmp[label_col].fillna(cmp[f"{label_col}_y"])
-        else:
-            raise KeyError(
-                f"'{label_col}' not found in cmp. "
-                f"Available label-like cols: {[c for c in cmp.columns if 'nta' in c or 'puma' in c]}"
-            )
-
-    cols = [label_col, "puma", "dow", raw_col, post_mean_col, post_low_col, post_high_col]
-
-    # get top-N; make_topn_table will still create top["label"] using puma+dow,
-    # so we'll overwrite it with an nta_puma-based label after.
-    top = make_topn_table(cmp, sort_by=sort_by, ascending=False, n=n, cols=cols)
-
-    # --- overwrite plotting label to use nta_puma for readability ---
-    top["label"] = top[label_col].astype(str) + " | " + top["dow"].astype(str)
-
-    y = np.arange(len(top))
-
-    plt.figure(figsize=(10, 6))
-    # posterior interval
-    plt.hlines(
-        y=y,
-        xmin=top[post_low_col],
-        xmax=top[post_high_col],
-        alpha=0.6,
-        label="Posterior 90% interval",
-    )
-    # posterior mean
-    plt.scatter(
-        top[post_mean_col],
-        y,
-        zorder=3,
-        label="Posterior mean",
-    )
-    # raw baseline
-    plt.scatter(
-        top[raw_col],
-        y,
-        marker="x",
-        s=80,
-        zorder=4,
-        label="Raw baseline",
-    )
-
-    plt.yticks(y, top["label"])
-    plt.xlabel("Typical daily complaint count")
-    plt.title(f"Top {n} by {sort_by}: raw baseline vs posterior (with 90% interval)")
-    plt.grid(axis="x", alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    return top
 
 def plot_puma_model_vs_observed(
     df,
