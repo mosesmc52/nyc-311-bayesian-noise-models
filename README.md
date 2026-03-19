@@ -1,4 +1,7 @@
-## 📊 NYC 311 Noise Complaint Modeling (Bayesian)
+
+![Screenshot of project](images/ODW-2026-banner.png)
+
+## NYC 311 Noise Complaint Modeling (Bayesian)
 Bayesian hierarchical models for forecasting NYC 311 noise complaints and quantifying urban stress.
 
 [Presentation](https://docs.google.com/presentation/d/1vLMbCHvBLH5sb2UQLPi-YPjA2fshaUcXq7H0l-lGHhA/edit?usp=sharing)
