@@ -63,6 +63,7 @@ nyc-311-bayesian-noise-model/
 │
 ├── images/
 │   ├── ODW-2026-banner.png
+│
 ├── notebooks/             # Jupyter notebooks (EDA + modeling)
 │   ├── 00_get_that_data.ipynb
 │   ├── 02_explore_noise_patterns.ipynb
