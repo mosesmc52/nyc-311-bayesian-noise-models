@@ -170,6 +170,50 @@ def export_puma_kepler(
 
     return gdf
 
+def export_geo_kepler(
+    df: pd.DataFrame,
+    *,
+    geojson_path: str,
+    df_key: str,
+    geo_key: str,
+    value_cols: list[str] | None = None,
+    fill_value: float | int | None = 0,
+    out_path: str | Path,
+    crs: str = "EPSG:4326",
+) -> gpd.GeoDataFrame:
+    """
+    Merge an aggregated dataframe with arbitrary polygons and export a Kepler-ready GeoJSON.
+    Numeric value columns are rounded to the nearest .001 for cleaner visualization.
+    """
+
+    gdf_geo = gpd.read_file(geojson_path)
+    gdf_geo[df_key] = gdf_geo[geo_key].astype(str)
+
+    df = df.copy()
+    df[df_key] = df[df_key].astype(str)
+
+    gdf = gdf_geo.merge(df, on=df_key, how="left")
+
+    if gdf.crs is None or gdf.crs.to_string() != crs:
+        gdf = gdf.to_crs(crs)
+
+    if value_cols and fill_value is not None:
+        for col in value_cols:
+            if col in gdf.columns:
+                gdf[col] = gdf[col].fillna(fill_value)
+
+    if value_cols:
+        for col in value_cols:
+            if col in gdf.columns:
+                gdf[col] = pd.to_numeric(gdf[col], errors="coerce").round(3)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    gdf.to_file(out_path, driver="GeoJSON")
+
+    return gdf
+
 
 def build_typical_week_city_relative_ratio(
     df: pd.DataFrame,
@@ -405,16 +449,19 @@ def make_daily_table_for_model_with_nta(
 def kepler_typical_week_from_dow_complaint(
     df: pd.DataFrame,
     *,
-    puma_geojson_path: str,
+    puma_geojson_path: str | None = None,
     out_path: str,
     puma_col: str = "puma",
+    geojson_path: str | None = None,
+    df_key: str | None = None,
+    geo_key: str | None = None,
     crs: str = "EPSG:4326",
 ):
     """
     Export a typical-week GeoJSON for Kepler from a (puma, dow*) dataframe.
 
     Required columns in df:
-      - puma
+      - geography key column
       - date (datetime64)  [for animation]
       - any numeric columns to visualize
 
@@ -423,22 +470,29 @@ def kepler_typical_week_from_dow_complaint(
     df : pd.DataFrame
         Tidy dataframe (posterior or raw) with one row per (puma, dow)
     puma_geojson_path : str
-        Path to PUMA GeoJSON
+        Backward-compatible alias for geojson_path
     out_path : str
         Output GeoJSON path
     """
 
+    geojson_path = geojson_path or puma_geojson_path
+    df_key = df_key or puma_col
+    geo_key = geo_key or "PUMA"
+
+    if geojson_path is None:
+        raise ValueError("Provide geojson_path (or puma_geojson_path).")
+
     # --- Load polygons
-    gdf_puma = gpd.read_file(puma_geojson_path)
-    gdf_puma[puma_col] = gdf_puma["PUMA"].astype(str)
+    gdf_geo = gpd.read_file(geojson_path)
+    gdf_geo[df_key] = gdf_geo[geo_key].astype(str)
 
     # --- Type safety
     df = df.copy()
-    df[puma_col] = df[puma_col].astype(str)
-    gdf_puma[puma_col] = gdf_puma[puma_col].astype(str)
+    df[df_key] = df[df_key].astype(str)
+    gdf_geo[df_key] = gdf_geo[df_key].astype(str)
 
     # --- Merge
-    gdf = gdf_puma.merge(df, on=puma_col, how="left")
+    gdf = gdf_geo.merge(df, on=df_key, how="left")
 
     # --- CRS for Kepler
     gdf = gdf.to_crs(crs)
@@ -510,6 +564,15 @@ def plot_puma_model_vs_observed(
 
     df_plot = df[df["dow"] == dow].copy()
 
+    low_col = "lam_low_90" if "lam_low_90" in df_plot.columns else "lam_mean_low_90"
+    high_col = "lam_high_90" if "lam_high_90" in df_plot.columns else "lam_mean_high_90"
+
+    if low_col not in df_plot.columns or high_col not in df_plot.columns:
+        raise KeyError(
+            "Expected posterior interval columns 'lam_low_90'/'lam_high_90' "
+            "or 'lam_mean_low_90'/'lam_mean_high_90'."
+        )
+
     df_plot = df_plot.sort_values(sort_by)
 
     total = len(df_plot)
@@ -537,8 +600,8 @@ def plot_puma_model_vs_observed(
     # credible intervals
     ax.hlines(
         y=y,
-        xmin=df_plot["lam_low_90"],
-        xmax=df_plot["lam_high_90"],
+        xmin=df_plot[low_col],
+        xmax=df_plot[high_col],
         color="steelblue",
         lw=2
     )
@@ -615,7 +678,13 @@ def compare_models_loo_waic(idata_model2, idata_model3, *, m2_name="Model 2", m3
 
     return loo_table, waic_table
 
-def make_typical_week_2025(df_2025, *, complaint_col="descriptor_group", months = [6, 7, 8]):
+def make_typical_week_2025(
+    df_2025,
+    *,
+    complaint_col="descriptor_group",
+    months=[6, 7, 8],
+    geo_col="puma",
+):
     x = df_2025.copy()
     x["created_bucket"] = pd.to_datetime(x["created_bucket"], errors="coerce")
     x = x[x["created_bucket"].notna()].copy()
@@ -628,16 +697,16 @@ def make_typical_week_2025(df_2025, *, complaint_col="descriptor_group", months 
 
     x["date"] = x["created_bucket"].dt.normalize()
     x["dow"] = x["date"].dt.day_name()
-    x["puma"] = x["puma"].astype(str).str.strip()
+    x[geo_col] = x[geo_col].astype(str).str.strip()
 
     daily = (
-        x.groupby(["puma", "dow", "date"], as_index=False)["complaint_count"]
+        x.groupby([geo_col, "dow", "date"], as_index=False)["complaint_count"]
          .sum()
-         .rename(columns={"complaint_count": "daily_count"})
+         .rename(columns={geo_col: "geo", "complaint_count": "daily_count"})
     )
 
     typical_2025 = (
-        daily.groupby(["puma", "dow"], as_index=False)["daily_count"]
+        daily.groupby(["geo", "dow"], as_index=False)["daily_count"]
              .median()
              .rename(columns={"daily_count": "observed_2025"})
     )
@@ -649,6 +718,8 @@ def make_daily_observed_2025(
     *,
     complaint_value=None,
     complaint_col="descriptor_group",
+    geo_col="puma",
+    label_col="nta_puma",
 ):
     x = df_2025.copy()
 
@@ -671,14 +742,14 @@ def make_daily_observed_2025(
     x["dow"] = x["date"].dt.day_name()
 
     # --- Clean geographic keys ---
-    x["puma"] = x["puma"].astype(str).str.strip()
-    x["nta_puma"] = x["nta_puma"].astype(str).str.strip()
+    x[geo_col] = x[geo_col].astype(str).str.strip()
+    x[label_col] = x[label_col].astype(str).str.strip()
 
     # --- Aggregate ---
     daily_obs = (
-        x.groupby(["puma", "nta_puma", "date", "dow"], as_index=False)["complaint_count"]
+        x.groupby([geo_col, label_col, "date", "dow"], as_index=False)["complaint_count"]
          .sum()
-         .rename(columns={"complaint_count": "daily_count"})
+         .rename(columns={geo_col: "geo", label_col: "geo_label", "complaint_count": "daily_count"})
     )
 
     # Ensure datetime64[ns]
@@ -706,6 +777,10 @@ def random_summer_date(year: int) -> str:
 
 def summarize_lam_posterior(idata, value_name):
     lam_post = idata.posterior["lam"]
+    geo_dim = next((dim for dim in lam_post.dims if dim in {"puma", "nta"}), None)
+
+    if geo_dim is None:
+        raise ValueError(f"Expected 'lam' to include a 'puma' or 'nta' dimension, got {lam_post.dims}.")
 
     mean_df = (
         lam_post
@@ -718,7 +793,7 @@ def summarize_lam_posterior(idata, value_name):
         az.hdi(lam_post, hdi_prob=0.90)["lam"]
         .to_dataframe(name="lam_hdi")
         .reset_index()
-        .pivot_table(index=["puma", "dow"], columns="hdi", values="lam_hdi")
+        .pivot_table(index=[geo_dim, "dow"], columns="hdi", values="lam_hdi")
         .reset_index()
         .rename(columns={
             "lower": f"{value_name}_low_90",
@@ -726,6 +801,6 @@ def summarize_lam_posterior(idata, value_name):
         })
     )
 
-    out = mean_df.merge(hdi_df, on=["puma", "dow"], how="left")
+    out = mean_df.merge(hdi_df, on=[geo_dim, "dow"], how="left")
     out[f"{value_name}_width_90"] = out[f"{value_name}_high_90"] - out[f"{value_name}_low_90"]
     return out
