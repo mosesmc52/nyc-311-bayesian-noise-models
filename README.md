@@ -65,9 +65,11 @@ nyc-311-bayesian-noise-model/
 │   ├── ODW-2026-banner.png
 │
 ├── notebooks/             # Jupyter notebooks (EDA + modeling)
-│   ├── 00_get_that_data.ipynb
-│   ├── 02_explore_noise_patterns.ipynb
-│   ├── 03_sharing_information_across_neighborhoods.ipynb
+│   ├── 0_get_that_data.ipynb
+│   ├── 01_explore_noise_patterns.ipynb
+│   ├── 02_fully_pooled_citywide_baseline.ipynb
+│   ├── 02_unpooled_nta_neighborhood_differences.ipynb
+│   ├── 03_partially_pooled_nta_puma_grouped.ipynb
 │   ├── 04_testing_predictions_on_2025.ipynb
 │
 ├── queries/
@@ -164,21 +166,27 @@ Raw data is ingested via scripts in `scripts/ingest/`
 - Explore complaint categories and temporal patterns, including weekday effects
 - Rank the quietest and noisiest neighborhoods
 
-**2. Baseline Model (`02_neighborhood_differences.ipynb`)**
+**2. Model 1: Fully Pooled (`02_model1_fully_pooled_citywide_baseline.ipynb`)**
+
+- Fit a citywide fully pooled baseline over complaint category and weekday
+- Establish the simplest benchmark before introducing geography-specific structure
+- Visualize pooled weekday patterns across complaint groups
+
+**3. Model 2: Unpooled NTA (`02_model2_unpooled_nta_neighborhood_differences.ipynb`)**
 
 - Compare raw city-relative intensity across neighborhoods
 - Build an unpooled Poisson model as a baseline
-- Model complaint counts at the PUMA level
+- Model complaint counts at the NTA level
 
-**3. Hierarchical Model (`03_sharing_information_across_neighborhoods.ipynb`)**
+**4. Model 3: Partially Pooled NTA | PUMA Grouped (`03_model3_partially_pooled_nta_puma_grouped.ipynb`)**
 
 - Build a hierarchical model with partial pooling
 - Use an NTA-level baseline with PUMA-level deviations
-- Compare the non-hierarchical model against the hierarchical model
+- Compare the unpooled NTA model against the partially pooled NTA | PUMA grouped model
 
-**4. Model Evaluation (`04_testing_predictions_on_2025.ipynb`)**
+**5. Model Evaluation (`04_testing_predictions_on_2025.ipynb`)**
 
-- Evaluate the hierarchical model on 2025 test data
+- Evaluate the partially pooled NTA | PUMA grouped model on 2025 test data
 - Use calibration plots to assess predictive performance and identify areas for improvement
 - Perform coverage analysis using credible intervals
 

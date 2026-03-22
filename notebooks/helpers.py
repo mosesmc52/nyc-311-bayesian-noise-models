@@ -215,6 +215,232 @@ def export_geo_kepler(
     return gdf
 
 
+
+def plot_panel_mu_by_weekday(
+    idata,
+    agg_city,
+    *,
+    dim_name="dow_complaint",
+    mu_name="mu",
+    sep="__",
+    dow_order=("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
+    top_n=None,
+    hdi=(0.05, 0.95),
+    ncols=4,
+    figsize_per_panel=(3.4, 2.6),
+    show_observed=True,
+    show_weekday_mean=True,
+):
+    # ---------- posterior ----------
+    mu_da = idata.posterior[mu_name]
+    df_post = mu_da.to_dataframe(name="mu").reset_index()
+
+    parts = df_post[dim_name].astype(str).str.rsplit(sep, n=1, expand=True)
+    df_post["complaint"] = parts[0]
+    df_post["dow"] = parts[1]
+    df_post["dow"] = pd.Categorical(df_post["dow"], categories=list(dow_order), ordered=True)
+
+    q_lo, q_hi = hdi
+    post_agg = (
+        df_post.groupby(["complaint", "dow"])["mu"]
+        .agg(
+            mean="mean",
+            low=lambda s: s.quantile(q_lo),
+            high=lambda s: s.quantile(q_hi),
+        )
+        .reset_index()
+    )
+
+    # ---------- observed ----------
+    obs = agg_city.copy()
+    parts_obs = obs[dim_name].astype(str).str.rsplit(sep, n=1, expand=True)
+    obs["complaint"] = parts_obs[0]
+    obs["dow"] = parts_obs[1]
+    obs["dow"] = pd.Categorical(obs["dow"], categories=list(dow_order), ordered=True)
+
+    # choose complaints by observed size
+    obs_rank = (
+        obs.groupby("complaint", as_index=False)["avg_daily_count"]
+        .sum()
+        .sort_values("avg_daily_count", ascending=False)
+    )
+
+    complaints = (
+        obs_rank["complaint"].head(top_n).tolist()
+        if top_n is not None
+        else obs_rank["complaint"].tolist()
+    )
+
+    post_agg = post_agg[post_agg["complaint"].isin(complaints)]
+    obs = obs[obs["complaint"].isin(complaints)]
+
+    plot_df = post_agg.merge(
+        obs[["complaint", "dow", "avg_daily_count"]],
+        on=["complaint", "dow"],
+        how="left",
+    )
+
+    n = len(complaints)
+    if n == 0:
+        raise ValueError("No complaint groups available to plot.")
+
+    ncols = min(ncols, n)
+    nrows = int(np.ceil(n / ncols))
+
+    fig = plt.figure(figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows))
+
+    for i, comp in enumerate(complaints, start=1):
+        ax = plt.subplot(nrows, ncols, i)
+
+        sub = (
+            plot_df[plot_df["complaint"] == comp]
+            .set_index("dow")
+            .reindex(list(dow_order))
+        )
+
+        x = np.arange(len(dow_order))
+
+        y = sub["mean"].to_numpy(dtype=float)
+        low = sub["low"].to_numpy(dtype=float)
+        high = sub["high"].to_numpy(dtype=float)
+        obs_y = sub["avg_daily_count"].to_numpy(dtype=float)
+
+        valid = np.isfinite(y) & np.isfinite(low) & np.isfinite(high)
+        xv = x[valid]
+        yv = y[valid]
+        lowv = low[valid]
+        highv = high[valid]
+
+        # complaint-specific observed weekday baseline
+        complaint_baseline = (
+            obs[obs["complaint"] == comp]
+            .set_index("dow")["avg_daily_count"]
+            .reindex(dow_order)
+            .to_numpy(dtype=float)
+        )
+
+        # y-axis just above everything shown in this panel
+        y_max = np.nanmax([
+            np.nanmax(high) if np.isfinite(high).any() else 0,
+            np.nanmax(obs_y) if np.isfinite(obs_y).any() else 0,
+            np.nanmax(complaint_baseline) if np.isfinite(complaint_baseline).any() else 0,
+        ]) * 1.10
+
+        # posterior intervals first, lighter
+        ax.errorbar(
+            xv,
+            yv,
+            yerr=np.vstack([yv - lowv, highv - yv]),
+            fmt="none",
+            ecolor="0.65",
+            elinewidth=1.6,
+            capsize=3,
+            alpha=0.8,
+            zorder=1,
+        )
+
+        # posterior mean points
+        ax.scatter(
+            xv,
+            yv,
+            color="0.2",
+            s=34,
+            marker="o",
+            zorder=3,
+            label="Posterior mean" if i == 1 else None,
+        )
+
+        # observed average daily counts as hollow circles
+        if show_observed and np.isfinite(obs_y).any():
+            obs_mask = np.isfinite(obs_y)
+            ax.scatter(
+                x[obs_mask],
+                obs_y[obs_mask],
+                facecolors="none",
+                edgecolors="0.25",
+                linewidths=1.6,
+                marker="o",
+                s=52,
+                alpha=0.9,
+                zorder=2,
+                label="Observed avg" if i == 1 else None,
+            )
+
+        # complaint-specific weekday baseline as lighter dashed line
+        if show_weekday_mean and np.isfinite(complaint_baseline).any():
+            base_mask = np.isfinite(complaint_baseline)
+            ax.plot(
+                x[base_mask],
+                complaint_baseline[base_mask],
+                linestyle="--",
+                linewidth=1.8,
+                color="0.45",
+                alpha=0.8,
+                zorder=0,
+                label="Observed baseline" if i == 1 else None,
+            )
+
+        # min / max from posterior mean with distinct shapes
+        if len(xv) > 0:
+            min_local = np.argmin(yv)
+            max_local = np.argmax(yv)
+
+            imin = xv[min_local]
+            imax = xv[max_local]
+
+            ymin = yv[min_local]
+            ymax_pt = yv[max_local]
+
+            # max: red triangle up
+            ax.scatter(
+                [imax],
+                [ymax_pt],
+                color="red",
+                s=90,
+                marker="^",
+                zorder=5,
+                label="Max posterior" if i == 1 else None,
+            )
+
+            # min: blue triangle down
+            ax.scatter(
+                [imin],
+                [ymin],
+                color="blue",
+                s=90,
+                marker="v",
+                zorder=5,
+                label="Min posterior" if i == 1 else None,
+            )
+
+            # text labels
+            y_offset = y_max * 0.03
+            ax.text(imax, ymax_pt + y_offset, "Max", color="red", fontsize=8,
+                    ha="center", va="bottom")
+            ax.text(imin, ymin - y_offset, "Min", color="blue", fontsize=8,
+                    ha="center", va="top")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([d[:3] for d in dow_order])
+        ax.set_ylim(0, y_max)
+        ax.set_title(comp, fontsize=10)
+        ax.grid(True, alpha=0.20)
+
+        if i % ncols == 1:
+            ax.set_ylabel("Avg daily count")
+
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper right", frameon=False)
+
+    fig.suptitle(
+        "Expected Daily Complaints by Weekday\n"
+        "Posterior vs Observed vs Complaint Baseline",
+        y=1.02,
+    )
+
+    plt.tight_layout()
+    plt.show()
+
 def build_typical_week_city_relative_ratio(
     df: pd.DataFrame,
     *,
