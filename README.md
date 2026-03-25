@@ -6,6 +6,20 @@ Bayesian hierarchical models for forecasting NYC 311 noise complaints and quanti
 
 [Presentation](https://docs.google.com/presentation/d/1vLMbCHvBLH5sb2UQLPi-YPjA2fshaUcXq7H0l-lGHhA/edit?usp=sharing)
 
+
+### Kepler Maps
+
+This zip file contains the Kepler maps used in the presentation:
+
+- **Slide 24 – Where Are Complaints Concentrated Across NYC?**  
+  - `03_01.html`
+
+- **Slide 26 – Where Do Prediction Errors Occur?**  
+  - `03_02.html`
+
+[Download Kepler Maps](https://drive.google.com/file/d/1KNrjP8SRHJfdn7d5JvioaDCx-55OHC1w/view?usp=sharing)
+
+
 ### Project Overview
 
 This project models and predicts NYC 311 noise complaints using Bayesian hierarchical models built with PyMC.
